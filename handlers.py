@@ -1,116 +1,137 @@
-from aiogram import Router, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+import html
+import logging
+
+from aiogram import F, Router
+from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from database import save_user, get_all_users
+from aiogram.types import Message, ReplyKeyboardRemove
+
 from config import config
+from database import count_leads, list_leads, save_lead
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
-CATEGORIES = {
-    "cat1": {"name": "Категория 1", "items": ["Товар 1", "Товар 2", "Товар 3", "Товар 4"]},
-    "cat2": {"name": "Категория 2", "items": ["Товар A", "Товар B", "Товар C", "Товар D"]},
-}
+MAX_FIELD_LEN = 128
+PAGE_SIZE = 20
 
-class SurveyStates(StatesGroup):
-    waiting_for_category = State()
-    waiting_for_item = State()
-    waiting_for_name = State()
-    waiting_for_city = State()
+GREETING = "Есть люди, которые готовы действовать. Кто-то должен навести порядок."
+ASK_NAME = "Как вас зовут?"
+ASK_CITY = "Приятно познакомиться, {name}! Из какого вы города?"
+DONE = "Координатор свяжется с вами в ближайшее время."
+NEED_TEXT = "Пожалуйста, отправьте ответ текстом."
+TOO_LONG = f"Слишком длинный ответ. Уложитесь, пожалуйста, в {MAX_FIELD_LEN} символов."
+
+
+class Survey(StatesGroup):
+    name = State()
+    city = State()
+
+
+def _clean(text: str) -> str:
+    return " ".join(text.split())
+
+
+class IsAdmin(BaseFilter):
+    """Пропускает только пользователей из ADMIN_IDS (.env)."""
+
+    async def __call__(self, message: Message) -> bool:
+        return message.from_user is not None and config.is_admin(message.from_user.id)
+
+
+# --- Админские команды регистрируем первыми, иначе их перехватят FSM-хендлеры ---
+
+
+@router.message(Command("leads", "get_some_info"), IsAdmin())
+async def cmd_leads(message: Message, command: CommandObject) -> None:
+    """Список заявок постранично: /leads, /leads 2, /leads 3 ..."""
+    page = 1
+    if command.args and command.args.strip().isdigit():
+        page = max(1, int(command.args.strip()))
+
+    total = await count_leads()
+    if total == 0:
+        await message.answer("Заявок пока нет.")
+        return
+
+    pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    if page > pages:
+        await message.answer(f"Такой страницы нет. Всего страниц: {pages}.")
+        return
+
+    leads = await list_leads(limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE)
+
+    lines = [f"<b>Заявки: {total}</b> (страница {page} из {pages})", ""]
+    for i, lead in enumerate(leads, start=(page - 1) * PAGE_SIZE + 1):
+        username = f" (@{html.escape(lead.username)})" if lead.username else ""
+        lines.append(
+            f"{i}. <b>{html.escape(lead.name)}</b> — {html.escape(lead.city)}\n"
+            f"    id: <code>{lead.tg_id}</code>{username}\n"
+            f"    {lead.created_at:%d.%m.%Y %H:%M} UTC"
+        )
+    if page < pages:
+        lines.append(f"\nСледующая страница: /leads {page + 1}")
+
+    await message.answer("\n".join(lines))
+
+
+# --- Сценарий пользователя ---
+
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Продолжить")]],
-        resize_keyboard=True
-    )
-    await message.answer("Привет. Это магазин. Нажмите 'Продолжить', чтобы выбрать товар.", reply_markup=keyboard)
-    await state.set_state(SurveyStates.waiting_for_category)
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.set_state(Survey.name)
+    await message.answer(GREETING, reply_markup=ReplyKeyboardRemove())
+    await message.answer(ASK_NAME)
 
-# Обработка "Привет" (если пользователь просто напишет "привет")
-@router.message(F.text.lower().in_({"привет", "hi", "hello", "hey"}))
-async def handle_greeting(message: Message, state: FSMContext):
-    await cmd_start(message, state)
 
-@router.message(SurveyStates.waiting_for_category, F.text == "Продолжить")
-async def process_continue(message: Message, state: FSMContext):
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=CATEGORIES["cat1"]["name"])],
-            [KeyboardButton(text=CATEGORIES["cat2"]["name"])],
-        ],
-        resize_keyboard=True
-    )
-    await message.answer("Выберите категорию:", reply_markup=keyboard)
-    await state.set_state(SurveyStates.waiting_for_category)
-
-@router.message(SurveyStates.waiting_for_category)
-async def process_category(message: Message, state: FSMContext):
-    selected_cat = None
-    for key, cat in CATEGORIES.items():
-        if cat["name"] == message.text:
-            selected_cat = cat
-            await state.update_data(selected_category=key)
-            break
-    if not selected_cat:
-        await message.answer("Пожалуйста, выберите категорию из списка.")
+@router.message(Survey.name, F.text)
+async def process_name(message: Message, state: FSMContext) -> None:
+    name = _clean(message.text)
+    if not name:
+        await message.answer(NEED_TEXT)
+        return
+    if len(name) > MAX_FIELD_LEN:
+        await message.answer(TOO_LONG)
         return
 
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=item)] for item in selected_cat["items"]],
-        resize_keyboard=True
-    )
-    await message.answer(f"Товары в категории {selected_cat['name']}:\nВыберите товар:", reply_markup=keyboard)
-    await state.set_state(SurveyStates.waiting_for_item)
+    await state.update_data(name=name)
+    await state.set_state(Survey.city)
+    await message.answer(ASK_CITY.format(name=html.escape(name)))
 
-@router.message(SurveyStates.waiting_for_item)
-async def process_item(message: Message, state: FSMContext):
-    data = await state.get_data()
-    selected_cat = CATEGORIES.get(data.get("selected_category"))
-    if not selected_cat or message.text not in selected_cat["items"]:
-        await message.answer("Пожалуйста, выберите товар из списка.")
+
+@router.message(Survey.city, F.text)
+async def process_city(message: Message, state: FSMContext) -> None:
+    city = _clean(message.text)
+    if not city:
+        await message.answer(NEED_TEXT)
+        return
+    if len(city) > MAX_FIELD_LEN:
+        await message.answer(TOO_LONG)
         return
 
-    await state.update_data(selected_item=message.text)
-    await message.answer("Представьтесь, пожалуйста (ваше имя):", reply_markup=ReplyKeyboardRemove())
-    await state.set_state(SurveyStates.waiting_for_name)
-
-@router.message(SurveyStates.waiting_for_name)
-async def process_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await message.answer("Из какого вы города?", reply_markup=ReplyKeyboardRemove())
-    await state.set_state(SurveyStates.waiting_for_city)
-
-@router.message(SurveyStates.waiting_for_city)
-async def process_city(message: Message, state: FSMContext):
     data = await state.get_data()
-    user = message.from_user
-    tg_id = user.id  # Только ID — он всегда есть
-
-    save_user(
-        tg_id=tg_id,
-        display_name=data["name"],
-        city=message.text,
-        category_choice=f"{data.get('selected_category')}:{data.get('selected_item', '')}"
-    )
-
-    await message.answer("Отлично! Мы с вами свяжемся в ближайшее время!", reply_markup=ReplyKeyboardRemove())
     await state.clear()
 
-@router.message(F.text.startswith("/get_some_info"))
-async def admin_panel(message: Message):
-    if message.from_user.id not in config.ADMIN_IDS:
-        return
-    users = get_all_users()
-    if not users:
-        await message.answer("Нет записей.")
-        return
-    text = "Список пользователей:\n\n"
-    for user in users:
-        text += f"ID: {user.tg_id}\n"
-        text += f"  Имя: {user.display_name}\n"
-        text += f"  Город: {user.city}\n"
-        text += f"  Выбор: {user.category_choice or 'N/A'}\n"
-        text += f"  Дата: {user.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
-    await message.answer(text)
+    lead = await save_lead(
+        tg_id=message.from_user.id,
+        username=message.from_user.username,
+        name=data["name"],
+        city=city,
+    )
+    logger.info("Новая заявка: %r", lead)
+
+    await message.answer(DONE, reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(StateFilter(Survey.name, Survey.city))
+async def process_non_text(message: Message) -> None:
+    await message.answer(NEED_TEXT)
+
+
+@router.message()
+async def fallback(message: Message, state: FSMContext) -> None:
+    """Любое сообщение вне сценария начинает анкету заново."""
+    await cmd_start(message, state)
